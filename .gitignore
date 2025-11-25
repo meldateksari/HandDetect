@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE files
+.vscode/
+.idea/
+
+# Large AI files
+*.dll
+*.pt
+*.pth
+*.h5
+*.onnx
+*.tflite
+*.weights
+
+# Datasets
+dataset/
+data/
