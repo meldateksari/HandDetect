@@ -1,230 +1,262 @@
+import sys
 import cv2
 import numpy as np
 import time
 import math
 import pyautogui
-
 import os
-# TensorFlow / TFLite loglarını azalt
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"   # 0=INFO, 1=WARNING, 2=ERROR, 3=FATAL
-# Google logging/absl uyarılarını kapat
-os.environ["GLOG_minloglevel"] = "3"
-os.environ["GLOG_logtostderr"] = "1"
+import platform
 
-# MediaPipe 0.10.x API
+# PyQt5 Uygulaması için
+from PyQt5.QtWidgets import QApplication
+# Arayüz dosyamızdan import (Dosya yapısına uygun)
+from ui.interface import HandUI
+
+# Mediapipe ve Log Ayarları
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["GLOG_minloglevel"] = "3"
 import mediapipe as mp
-from absl import logging as absl_logging
-absl_logging.set_verbosity(absl_logging.ERROR)
+
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
-mp_styles = mp.solutions.drawing_styles
 
-
-
-# ----------------- KONFİG -----------------
-CAM_INDEX = 0              # Birden fazla kameranız varsa 1,2 deneyebilirsiniz
-FRAME_WIDTH = 1280         # Yakınlaştırma/performans için düşürebilirsiniz
-FRAME_HEIGHT = 720
-
-#SMOOTHING_ALPHA = 0.25     # İmleç yumuşatma (0 < a ≤ 1). Daha küçük -> daha pürüzsüz
-#PINCH_THRESHOLD = 0.035     # Başparmak–parmak ucu arasındaki normalize mesafe eşiği
-#PINCH_HYSTERESIS = 0.005    # Eşik histerezis (stabilite)
-#DRAG_HOLD_DELAY = 0.20      # Sol-drag başlamadan önce pinch süresi (sn)
-#SCROLL_SENSITIVITY = 1500   # Scroll hızı (dy ile çarpılır)
-SHOW_OVERLAY = True         # Landmarks ve FPS gösterimi
-
-SMOOTHING_ALPHA = 0.12
-PINCH_THRESHOLD = 0.042
-PINCH_HYSTERESIS = 0.007
+# ----------------- KONFİGÜRASYON -----------------
+SMOOTHING_ALPHA = 0.15
+PINCH_THRESHOLD = 0.045
+PINCH_HYSTERESIS = 0.012
 DRAG_HOLD_DELAY = 0.35
 SCROLL_SENSITIVITY = 900
-
-
-# PyAutoGUI güvenlik
-pyautogui.FAILSAFE = False
+SCROLL_COOLDOWN = 0.08
+GESTURE_LOCK_TIME = 0.3
 SCREEN_W, SCREEN_H = pyautogui.size()
+pyautogui.FAILSAFE = False
 
 # ----------------- YARDIMCI FONKSİYONLAR -----------------
 def norm_dist(p1, p2):
-    """ İki nokta arası öklid mesafesi (normalize koordinatlar: 0..1). """
     dx = p1[0] - p2[0]
     dy = p1[1] - p2[1]
     return math.hypot(dx, dy)
 
 def ema(prev, new, alpha=SMOOTHING_ALPHA):
-    if prev is None:
-        return new
+    if prev is None: return new
     return (1 - alpha) * prev + alpha * new
 
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
-# ----------------- DURUM DEĞİŞKENLERİ -----------------
-prev_mouse_x = None
-prev_mouse_y = None
+def volume_system_control(action):
+    """İşletim sistemine göre ses kontrolü yapar."""
+    sys_plat = platform.system()
+    if sys_plat == "Windows":
+        if action == "increase": pyautogui.press("volumeup")
+        elif action == "decrease": pyautogui.press("volumedown")
+    elif sys_plat == "Darwin": # macOS
+        cmd = "set volume output volume (output volume of (get volume settings) + 5)" if action == "increase" else "set volume output volume (output volume of (get volume settings) - 5)"
+        os.system(f'osascript -e "{cmd}"')
+    elif sys_plat == "Linux":
+        sign = "+" if action == "increase" else "-"
+        os.system(f"amixer -D pulse sset Master 5%{sign}")
 
-left_pinch_active = False
-left_pinch_start_time = 0.0
-dragging = False
+# ----------------- MANTIK İŞLEMCİSİ (PROCESSOR) -----------------
+class GestureProcessor:
+    """
+    Tüm görüntü işleme ve gesture mantığı burada döner.
+    UI bu sınıfı sadece 'process_frame' fonksiyonu ile kullanır.
+    """
+    def __init__(self):
+        # Mediapipe Başlat
+        self.hands = mp_hands.Hands(
+            static_image_mode=False,
+            model_complexity=0,
+            max_num_hands=1,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
 
-right_pinch_active = False
-scroll_pinch_active = False
-prev_scroll_ref_y = None
+        # Durum Değişkenleri
+        self.prev_mouse_x = None
+        self.prev_mouse_y = None
+        
+        self.left_pinch_active = False
+        self.left_pinch_start_time = 0.0
+        self.dragging = False
 
-# Histerezisli eşik hesapları
-def below_thresh(d, t=PINCH_THRESHOLD):
-    return d < t
+        self.right_pinch_active = False
+        self.right_pinch_last_click = 0.0
 
-def above_release(d, t=PINCH_THRESHOLD + PINCH_HYSTERESIS):
-    return d > t
+        self.scroll_pinch_active = False
+        self.prev_scroll_ref_y = None
+        self.last_scroll_time = 0.0
 
-# ----------------- ANA UYGULAMA -----------------
-def main():
-    cap = cv2.VideoCapture(CAM_INDEX)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+        self.volume_active = False
+        self.prev_vol_ref_x = None
+        self.last_vol_time = 0.0
+        
+        self.active_gesture = None
+        self.gesture_lock_start = 0.0
 
-    global prev_mouse_x, prev_mouse_y
-    global left_pinch_active, left_pinch_start_time, dragging
-    global right_pinch_active, scroll_pinch_active, prev_scroll_ref_y
+    def can_start_gesture(self, gesture_type, now):
+        if self.active_gesture is None: return True
+        if self.active_gesture == gesture_type: return True
+        if now - self.gesture_lock_start > GESTURE_LOCK_TIME: return True
+        return False
 
-    # MediaPipe Hands
-    hands = mp_hands.Hands(
-        model_complexity=1,
-        max_num_hands=1,           # Tek el ile daha stabil
-        min_detection_confidence=0.6,
-        min_tracking_confidence=0.6
-    )
+    def set_active_gesture(self, gesture_type, now):
+        if self.active_gesture != gesture_type:
+            self.active_gesture = gesture_type
+            self.gesture_lock_start = now
 
-    fps_t0 = time.time()
-    fps_cnt = 0
-    fps_val = 0.0
+    def clear_active_gesture(self):
+        self.active_gesture = None
 
-    try:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                print("Kameradan görüntü alınamadı.")
-                break
+    def process_frame(self, frame):
+        """
+        Gelen ham frame'i işler, gestureları algılar, mouse/ses kontrolü yapar
+        ve üzerine çizim yapılmış frame ile durum metnini döndürür.
+        """
+        frame = cv2.flip(frame, 1)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        res = self.hands.process(rgb)
+        now = time.time()
+        
+        status_text = "El Algılanamadı"
 
-            # Aynalı görünüm (kullanıcı için doğal)
-            frame = cv2.flip(frame, 1)
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if res.multi_hand_landmarks:
+            status_text = "El Takip Ediliyor"
+            hand_landmarks = res.multi_hand_landmarks[0]
+            pts = [(lm.x, lm.y, lm.z) for lm in hand_landmarks.landmark]
+            h, w, c = frame.shape
 
-            # MediaPipe tahmini
-            res = hands.process(rgb)
+            # Parmak Uçları
+            thumb_tip = (pts[4][0], pts[4][1])
+            index_tip = (pts[8][0], pts[8][1])
+            middle_tip = (pts[12][0], pts[12][1])
+            ring_tip = (pts[16][0], pts[16][1])
+            pinky_tip = (pts[20][0], pts[20][1])
 
-            h, w, _ = frame.shape
-            now = time.time()
+            # --- MOUSE HAREKETİ (Başparmak Ucu - İstenildiği gibi) ---
+            raw_x = thumb_tip[0] * SCREEN_W
+            raw_y = thumb_tip[1] * SCREEN_H
+            self.prev_mouse_x = ema(self.prev_mouse_x, raw_x)
+            self.prev_mouse_y = ema(self.prev_mouse_y, raw_y)
+            
+            # Gesture kilitliyse (ses/scroll) mouse hareket etmesin
+            if not self.volume_active and not self.scroll_pinch_active:
+                mx = clamp(self.prev_mouse_x, 0, SCREEN_W - 1)
+                my = clamp(self.prev_mouse_y, 0, SCREEN_H - 1)
+                pyautogui.moveTo(mx, my, duration=0)
 
-            if res.multi_hand_landmarks:
-                hand_landmarks = res.multi_hand_landmarks[0]  # tek el
+            # Mesafeler
+            d_thumb_index = norm_dist(thumb_tip, index_tip)
+            d_thumb_middle = norm_dist(thumb_tip, middle_tip)
+            d_thumb_ring = norm_dist(thumb_tip, ring_tip)
+            d_thumb_pinky = norm_dist(thumb_tip, pinky_tip)
 
-                # Landmark'ları liste olarak al (normalize koordinatlar 0..1)
-                pts = [(lm.x, lm.y, lm.z) for lm in hand_landmarks.landmark]
+            # --- 1. SES KONTROL (Başparmak + Serçe) ---
+            if d_thumb_pinky < PINCH_THRESHOLD and self.can_start_gesture("volume", now):
+                if not self.volume_active:
+                    self.volume_active = True
+                    self.prev_vol_ref_x = index_tip[0]
+                    self.set_active_gesture("volume", now)
+            elif self.volume_active and d_thumb_pinky > (PINCH_THRESHOLD + PINCH_HYSTERESIS):
+                self.volume_active = False
+                self.prev_vol_ref_x = None
+                self.clear_active_gesture()
 
-                # Önemli noktalar (normalize)
-                thumb_tip = (pts[4][0], pts[4][1])
-                index_tip = (pts[8][0], pts[8][1])
-                middle_tip = (pts[12][0], pts[12][1])
-                ring_tip = (pts[16][0], pts[16][1])
+            if self.volume_active and self.prev_vol_ref_x is not None:
+                status_text = "MOD: SES KONTROL"
+                if (now - self.last_vol_time) >= 0.15: # Cooldown
+                    dx = index_tip[0] - self.prev_vol_ref_x
+                    if dx > 0.015: 
+                        volume_system_control("increase")
+                        self.prev_vol_ref_x = index_tip[0]
+                        self.last_vol_time = now
+                        status_text = "SES: ARTTIRILIYOR"
+                    elif dx < -0.015: 
+                        volume_system_control("decrease")
+                        self.prev_vol_ref_x = index_tip[0]
+                        self.last_vol_time = now
+                        status_text = "SES: AZALTILIYOR"
 
-                # --- İMLEÇ KONTROLÜ (işaret parmağı ucu) ---
-                # Normalized (0..1) -> ekran pikseli
-                raw_x = index_tip[0] * SCREEN_W
-                raw_y = index_tip[1] * SCREEN_H
-                # EMA yumuşatma
-                prev_mouse_x = ema(prev_mouse_x, raw_x)
-                prev_mouse_y = ema(prev_mouse_y, raw_y)
-                # Ekran sınırları
-                mx = clamp(prev_mouse_x, 0, SCREEN_W - 1)
-                my = clamp(prev_mouse_y, 0, SCREEN_H - 1)
-                pyautogui.moveTo(mx, my, duration=0)  # anlık, yumuşatmayı biz yaptık
+            # --- 2. SCROLL (Başparmak + Yüzük) ---
+            elif d_thumb_ring < PINCH_THRESHOLD and self.can_start_gesture("scroll", now):
+                if not self.scroll_pinch_active:
+                    self.scroll_pinch_active = True
+                    self.prev_scroll_ref_y = index_tip[1]
+                    self.set_active_gesture("scroll", now)
+            elif self.scroll_pinch_active and d_thumb_ring > (PINCH_THRESHOLD + PINCH_HYSTERESIS):
+                self.scroll_pinch_active = False
+                self.prev_scroll_ref_y = None
+                self.clear_active_gesture()
 
-                # --- GESTURE MESAFELERİ ---
-                d_thumb_index = norm_dist(thumb_tip, index_tip)
-                d_thumb_middle = norm_dist(thumb_tip, middle_tip)
-                d_thumb_ring   = norm_dist(thumb_tip, ring_tip)
-
-                # --- SOL TIK / SÜRÜKLE-BIRAK (Başparmak-İşaret pinch) ---
-                if not left_pinch_active and below_thresh(d_thumb_index):
-                    left_pinch_active = True
-                    left_pinch_start_time = now
-                elif left_pinch_active and above_release(d_thumb_index):
-                    # Bırakıldı
-                    left_pinch_active = False
-                    # Drag aktifse bırak
-                    if dragging:
-                        pyautogui.mouseUp()
-                        dragging = False
-                    else:
-                        # Kısa pinch -> tek tıklama
-                        # (Drag gecikmesinden kısa sürdüyse)
-                        if (now - left_pinch_start_time) < DRAG_HOLD_DELAY:
-                            pyautogui.click()
-
-                # Uzun pinch -> mouseDown (sürükle)
-                if left_pinch_active and not dragging and (now - left_pinch_start_time) >= DRAG_HOLD_DELAY:
-                    pyautogui.mouseDown()
-                    dragging = True
-
-                # --- SAĞ TIK (Başparmak-Orta pinch) ---
-                if not right_pinch_active and below_thresh(d_thumb_middle):
-                    right_pinch_active = True
-                elif right_pinch_active and above_release(d_thumb_middle):
-                    right_pinch_active = False
-                    pyautogui.click(button='right')
-
-                # --- SCROLL (Başparmak-Yüzük pinch + dikey hareket) ---
-                if not scroll_pinch_active and below_thresh(d_thumb_ring):
-                    scroll_pinch_active = True
-                    prev_scroll_ref_y = index_tip[1]
-                elif scroll_pinch_active and above_release(d_thumb_ring):
-                    scroll_pinch_active = False
-                    prev_scroll_ref_y = None
-
-                if scroll_pinch_active and prev_scroll_ref_y is not None:
-                    dy = index_tip[1] - prev_scroll_ref_y
-                    # Negatif dy -> yukarı kaydır (tarayıcı mantığıyla)
+            if self.scroll_pinch_active:
+                status_text = "MOD: SCROLL"
+                if self.prev_scroll_ref_y is not None and (now - self.last_scroll_time) >= SCROLL_COOLDOWN:
+                    dy = index_tip[1] - self.prev_scroll_ref_y
                     scroll_amount = int(-dy * SCROLL_SENSITIVITY)
-                    if scroll_amount != 0:
+                    if abs(scroll_amount) > 5:
                         pyautogui.scroll(scroll_amount)
-                        prev_scroll_ref_y = index_tip[1]
+                        self.prev_scroll_ref_y = index_tip[1]
+                        self.last_scroll_time = now
 
-                # Görsel çizimler
-                if SHOW_OVERLAY:
-                    mp_drawing.draw_landmarks(
-                        frame,
-                        hand_landmarks,
-                        mp_hands.HAND_CONNECTIONS,
-                        mp_styles.get_default_hand_landmarks_style(),
-                        mp_styles.get_default_hand_connections_style(),
-                    )
-                    # Eşik durumlarını metinle göster
-                    cv2.putText(frame, f"LeftPinch:{left_pinch_active} Drag:{dragging}", (10, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                    cv2.putText(frame, f"RightPinch:{right_pinch_active} ScrollPinch:{scroll_pinch_active}", (10, 60),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            # --- 3. SAĞ TIK (Başparmak + Orta) ---
+            elif d_thumb_middle < PINCH_THRESHOLD and self.can_start_gesture("right", now):
+                if not self.right_pinch_active:
+                    self.right_pinch_active = True
+                    self.set_active_gesture("right", now)
+            elif self.right_pinch_active and d_thumb_middle > (PINCH_THRESHOLD + PINCH_HYSTERESIS):
+                self.right_pinch_active = False
+                if (now - self.right_pinch_last_click) > 0.3:
+                    pyautogui.click(button='right')
+                    self.right_pinch_last_click = now
+                    status_text = "ISLEM: SAG TIK"
+                self.clear_active_gesture()
 
-            # FPS hesap/overlay
-            fps_cnt += 1
-            if now - fps_t0 >= 1.0:
-                fps_val = fps_cnt / (now - fps_t0)
-                fps_cnt = 0
-                fps_t0 = now
-            if SHOW_OVERLAY:
-                cv2.putText(frame, f"FPS: {fps_val:.1f}", (10, frame.shape[0]-10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+            # --- 4. SOL TIK / SÜRÜKLE (Başparmak + İşaret) ---
+            elif d_thumb_index < PINCH_THRESHOLD and self.can_start_gesture("left", now):
+                if not self.left_pinch_active:
+                    self.left_pinch_active = True
+                    self.left_pinch_start_time = now
+                    self.set_active_gesture("left", now)
+            elif self.left_pinch_active and d_thumb_index > (PINCH_THRESHOLD + PINCH_HYSTERESIS):
+                self.left_pinch_active = False
+                if self.dragging:
+                    pyautogui.mouseUp()
+                    self.dragging = False
+                    status_text = "ISLEM: SURUKLEME BITTI"
+                else:
+                    if (now - self.left_pinch_start_time) < DRAG_HOLD_DELAY:
+                        pyautogui.click()
+                        status_text = "ISLEM: SOL TIK"
+                self.clear_active_gesture()
 
-            cv2.imshow("El ile Kontrol - q ile cikis", frame)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
+            if self.left_pinch_active and not self.dragging and (now - self.left_pinch_start_time) >= DRAG_HOLD_DELAY:
+                pyautogui.mouseDown()
+                self.dragging = True
+                status_text = "MOD: SURUKLEME"
 
-    finally:
-        hands.close()
-        cap.release()
-        cv2.destroyAllWindows()
+            # --- ÇİZİM ---
+            for idx, lm in enumerate(hand_landmarks.landmark):
+                cx, cy = int(lm.x * w), int(lm.y * h)
+                color = (0, 255, 0)
+                if idx == 20 and self.volume_active: color = (255, 0, 0) # Serçe Kırmızı
+                if idx == 4: color = (0, 255, 255) # Başparmak (Mouse) Sarı/Turkuaz
+                cv2.circle(frame, (cx, cy), 4, color, -1)
+
+        return frame, status_text
+
+# ----------------- UYGULAMA BAŞLANGICI -----------------
+def main():
+    app = QApplication(sys.argv)
+    
+    # Logic nesnesini yarat
+    processor = GestureProcessor()
+    
+    # UI'ı yarat ve logic'i enjekte et
+    window = HandUI(processor)
+    window.show()
+    
+    sys.exit(app.exec_())
 
 if __name__ == "__main__":
     main()
