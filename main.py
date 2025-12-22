@@ -6,6 +6,7 @@ import platform
 
 import cv2
 import pyautogui
+import mediapipe as mp
 
 from PyQt5.QtWidgets import QApplication
 from ui.interface import HandUI
@@ -13,23 +14,19 @@ from ui.interface import HandUI
 # Mediapipe log azalt
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 os.environ["GLOG_minloglevel"] = "3"
-import mediapipe as mp
 
 mp_hands = mp.solutions.hands
 
 # ----------------- KONFİG -----------------
-# Mouse stabilizasyon
-CURSOR_DEADZONE_PX = 2          # mikro titremeyi yutar (1-4 arası)
-CURSOR_MAX_STEP_PX = 90         # ani zıplamayı sınırlar (frame başına max adım)
-USE_BLEND_POINT = True          # True: başparmak + index_mcp karışımı (çok daha stabil)
+CURSOR_DEADZONE_PX = 2
+CURSOR_MAX_STEP_PX = 90
+USE_BLEND_POINT = True
 
-# One Euro Filter (EMA'dan daha iyi)
-ONEEURO_MIN_CUTOFF = 1.2        # yükselt -> daha stabil (1.6-2.2 deneyebilirsin)
-ONEEURO_BETA = 0.015            # yükselt -> hızlı harekette gecikme azalır (0.02-0.04)
+ONEEURO_MIN_CUTOFF = 1.2
+ONEEURO_BETA = 0.015
 ONEEURO_D_CUTOFF = 1.0
 
-# Gesture
-PINCH_HYSTERESIS_RATIO = 0.08   # dinamik threshold'un yüzdesi (release)
+PINCH_HYSTERESIS_RATIO = 0.08
 DRAG_HOLD_DELAY = 0.35
 SCROLL_SENSITIVITY = 900
 SCROLL_COOLDOWN = 0.08
@@ -38,7 +35,6 @@ GESTURE_LOCK_TIME = 0.30
 VOLUME_COOLDOWN = 0.15
 VOLUME_STEP_DX = 0.015
 
-# PyAutoGUI
 SCREEN_W, SCREEN_H = pyautogui.size()
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0
@@ -54,10 +50,7 @@ def norm_dist(p1, p2):
 def volume_system_control(action):
     sys_plat = platform.system()
     if sys_plat == "Windows":
-        if action == "increase":
-            pyautogui.press("volumeup")
-        elif action == "decrease":
-            pyautogui.press("volumedown")
+        pyautogui.press("volumeup" if action == "increase" else "volumedown")
     elif sys_plat == "Darwin":
         cmd = (
             "set volume output volume (output volume of (get volume settings) + 5)"
@@ -72,7 +65,7 @@ def volume_system_control(action):
 
 # ----------------- One Euro Filter -----------------
 class LowPass:
-    def _init_(self):
+    def __init__(self):
         self.y = None
 
     def filt(self, x, a):
@@ -87,7 +80,7 @@ def _alpha(cutoff_hz, dt):
     return 1.0 / (1.0 + tau / max(1e-6, dt))
 
 class OneEuroFilter:
-    def _init_(self, min_cutoff=1.0, beta=0.0, d_cutoff=1.0):
+    def __init__(self, min_cutoff=1.0, beta=0.0, d_cutoff=1.0):
         self.min_cutoff = min_cutoff
         self.beta = beta
         self.d_cutoff = d_cutoff
@@ -96,7 +89,7 @@ class OneEuroFilter:
         self.last_t = None
         self.last_x = None
 
-    def _call_(self, x, t):
+    def __call__(self, x, t):
         if self.last_t is None:
             self.last_t = t
             self.last_x = x
@@ -120,7 +113,7 @@ class OneEuroFilter:
 
 # ----------------- PROCESSOR -----------------
 class GestureProcessor:
-    def _init_(self):
+    def __init__(self):
         self.hands = mp_hands.Hands(
             static_image_mode=False,
             model_complexity=0,
@@ -129,7 +122,6 @@ class GestureProcessor:
             min_tracking_confidence=0.60
         )
 
-        # Mouse filtreleri
         self.fx = OneEuroFilter(ONEEURO_MIN_CUTOFF, ONEEURO_BETA, ONEEURO_D_CUTOFF)
         self.fy = OneEuroFilter(ONEEURO_MIN_CUTOFF, ONEEURO_BETA, ONEEURO_D_CUTOFF)
 
@@ -154,6 +146,9 @@ class GestureProcessor:
 
         self.active_gesture = None
         self.gesture_lock_start = 0.0
+
+        # UI için "en son hareket"
+        self.last_gesture_text = "Bekleniyor"
 
     def can_start_gesture(self, gesture_type, now):
         if self.active_gesture is None:
@@ -185,13 +180,11 @@ class GestureProcessor:
         dx = x - self.prev_mx
         dy = y - self.prev_my
 
-        # Deadzone (mikro titreme)
         if abs(dx) < CURSOR_DEADZONE_PX:
             x = self.prev_mx
         if abs(dy) < CURSOR_DEADZONE_PX:
             y = self.prev_my
 
-        # Max step (ani zıplama)
         step = math.hypot(x - self.prev_mx, y - self.prev_my)
         if step > CURSOR_MAX_STEP_PX:
             r = CURSOR_MAX_STEP_PX / max(1e-6, step)
@@ -202,7 +195,6 @@ class GestureProcessor:
         pyautogui.moveTo(x, y, duration=0)
 
     def _reset_if_hand_lost(self):
-        # el kaybolunca sürükleme takılı kalmasın
         if self.dragging:
             try:
                 pyautogui.mouseUp()
@@ -216,6 +208,7 @@ class GestureProcessor:
         self.prev_scroll_ref_y = None
         self.prev_vol_ref_x = None
         self.clear_active_gesture()
+        self.last_gesture_text = "Bekleniyor"
 
     def process_frame(self, frame):
         frame = cv2.flip(frame, 1)
@@ -224,16 +217,16 @@ class GestureProcessor:
         now = time.time()
 
         status_text = "El Algılanamadı"
+        gesture_text = self.last_gesture_text  # default: en son ne ise onu göster
 
         if not res.multi_hand_landmarks:
             self._reset_if_hand_lost()
-            return frame, status_text
+            return frame, status_text, gesture_text
 
         hand_landmarks = res.multi_hand_landmarks[0]
         pts = [(lm.x, lm.y, lm.z) for lm in hand_landmarks.landmark]
         h, w, _ = frame.shape
 
-        # Landmarklar
         wrist = (pts[0][0], pts[0][1])
         thumb_tip = (pts[4][0], pts[4][1])
         index_mcp = (pts[5][0], pts[5][1])
@@ -243,7 +236,6 @@ class GestureProcessor:
         ring_tip = (pts[16][0], pts[16][1])
         pinky_tip = (pts[20][0], pts[20][1])
 
-        # Mouse hedef noktası (başparmak ucu çok jitter yapar -> karışım daha stabil)
         if USE_BLEND_POINT:
             nx = 0.65 * thumb_tip[0] + 0.35 * index_mcp[0]
             ny = 0.65 * thumb_tip[1] + 0.35 * index_mcp[1]
@@ -253,18 +245,15 @@ class GestureProcessor:
         raw_x = nx * SCREEN_W
         raw_y = ny * SCREEN_H
 
-        # Dinamik pinch threshold (el ölçeğine göre)
         hand_scale = max(1e-6, norm_dist(wrist, middle_mcp))
         pinch_th = clamp(0.42 * hand_scale, 0.030, 0.075)
         pinch_release = pinch_th * (1.0 + PINCH_HYSTERESIS_RATIO)
 
-        # Mesafeler
         d_thumb_index = norm_dist(thumb_tip, index_tip)
         d_thumb_middle = norm_dist(thumb_tip, middle_tip)
         d_thumb_ring = norm_dist(thumb_tip, ring_tip)
         d_thumb_pinky = norm_dist(thumb_tip, pinky_tip)
 
-        # Gesture modlarında mouse’u dondur
         if not self.volume_active and not self.scroll_pinch_active:
             self._move_cursor_stable(raw_x, raw_y, now)
 
@@ -276,6 +265,7 @@ class GestureProcessor:
                 self.volume_active = True
                 self.prev_vol_ref_x = index_tip[0]
                 self.set_active_gesture("volume", now)
+                gesture_text = "Ses Modu"
         elif self.volume_active and d_thumb_pinky > pinch_release:
             self.volume_active = False
             self.prev_vol_ref_x = None
@@ -290,11 +280,13 @@ class GestureProcessor:
                     self.prev_vol_ref_x = index_tip[0]
                     self.last_vol_time = now
                     status_text = "SES: ARTTIRILIYOR"
+                    gesture_text = "Ses Arttır"
                 elif dx < -VOLUME_STEP_DX:
                     volume_system_control("decrease")
                     self.prev_vol_ref_x = index_tip[0]
                     self.last_vol_time = now
                     status_text = "SES: AZALTILIYOR"
+                    gesture_text = "Ses Azalt"
 
         # 2) SCROLL (başparmak + yüzük)
         elif d_thumb_ring < pinch_th and self.can_start_gesture("scroll", now):
@@ -302,6 +294,7 @@ class GestureProcessor:
                 self.scroll_pinch_active = True
                 self.prev_scroll_ref_y = index_tip[1]
                 self.set_active_gesture("scroll", now)
+                gesture_text = "Scroll Modu"
         elif self.scroll_pinch_active and d_thumb_ring > pinch_release:
             self.scroll_pinch_active = False
             self.prev_scroll_ref_y = None
@@ -316,6 +309,7 @@ class GestureProcessor:
                     pyautogui.scroll(scroll_amount)
                     self.prev_scroll_ref_y = index_tip[1]
                     self.last_scroll_time = now
+                    gesture_text = "Scroll"
 
         # 3) SAĞ TIK (başparmak + orta)
         elif d_thumb_middle < pinch_th and self.can_start_gesture("right", now):
@@ -328,6 +322,7 @@ class GestureProcessor:
                 pyautogui.click(button="right")
                 self.right_pinch_last_click = now
                 status_text = "ISLEM: SAG TIK"
+                gesture_text = "Sağ Tıklandı"
             self.clear_active_gesture()
 
         # 4) SOL TIK / SÜRÜKLE (başparmak + işaret)
@@ -342,18 +337,24 @@ class GestureProcessor:
                 pyautogui.mouseUp()
                 self.dragging = False
                 status_text = "ISLEM: SURUKLEME BITTI"
+                gesture_text = "Sürükleme Bitti"
             else:
                 if (now - self.left_pinch_start_time) < DRAG_HOLD_DELAY:
                     pyautogui.click()
                     status_text = "ISLEM: SOL TIK"
+                    gesture_text = "Sol Tıklandı"
             self.clear_active_gesture()
 
         if self.left_pinch_active and not self.dragging and (now - self.left_pinch_start_time) >= DRAG_HOLD_DELAY:
             pyautogui.mouseDown()
             self.dragging = True
             status_text = "MOD: SURUKLEME"
+            gesture_text = "Sürükleme"
 
-        # Hafif çizim (CPU düşürür)
+        # UI için en son hareketi sakla
+        self.last_gesture_text = gesture_text
+
+        # Hafif çizim
         important = [0, 4, 5, 8, 12, 16, 20, 9]
         for idx in important:
             lm = hand_landmarks.landmark[idx]
@@ -367,22 +368,19 @@ class GestureProcessor:
                 color = (0, 255, 255)
             cv2.circle(frame, (cx, cy), 5, color, -1)
 
-        # debug: threshold
         cv2.putText(frame, f"pinch_th={pinch_th:.3f}", (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
 
-        return frame, status_text
+        return frame, status_text, gesture_text
 
 
-# ----------------- APP -----------------
 def main():
     app = QApplication(sys.argv)
-
     processor = GestureProcessor()
     window = HandUI(processor)
     window.show()
-
     sys.exit(app.exec_())
 
-if _name_ == "_main_":
+
+if __name__ == "__main__":
     main()
