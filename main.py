@@ -72,7 +72,7 @@ def volume_system_control(action):
 
 # ----------------- One Euro Filter -----------------
 class LowPass:
-    def __init__(self):
+    def _init_(self):
         self.y = None
 
     def filt(self, x, a):
@@ -87,7 +87,7 @@ def _alpha(cutoff_hz, dt):
     return 1.0 / (1.0 + tau / max(1e-6, dt))
 
 class OneEuroFilter:
-    def __init__(self, min_cutoff=1.0, beta=0.0, d_cutoff=1.0):
+    def _init_(self, min_cutoff=1.0, beta=0.0, d_cutoff=1.0):
         self.min_cutoff = min_cutoff
         self.beta = beta
         self.d_cutoff = d_cutoff
@@ -96,7 +96,7 @@ class OneEuroFilter:
         self.last_t = None
         self.last_x = None
 
-    def __call__(self, x, t):
+    def _call_(self, x, t):
         if self.last_t is None:
             self.last_t = t
             self.last_x = x
@@ -120,7 +120,7 @@ class OneEuroFilter:
 
 # ----------------- PROCESSOR -----------------
 class GestureProcessor:
-    def __init__(self):
+    def _init_(self):
         self.hands = mp_hands.Hands(
             static_image_mode=False,
             model_complexity=0,
@@ -384,5 +384,5 @@ def main():
 
     sys.exit(app.exec_())
 
-if __name__ == "__main__":
+if _name_ == "_main_":
     main()
