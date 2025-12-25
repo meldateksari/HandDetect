@@ -150,6 +150,39 @@ class GestureProcessor:
         # UI için "en son hareket"
         self.last_gesture_text = "Bekleniyor"
 
+        # Metrikler
+        self.metrics = {
+            "fps": 0.0,
+            "latency": 0.0,
+            "detection_confidence": 0.0,
+            "tracking_confidence": 0.0,
+            "hand_visible": False,
+            "velocity": 0.0,
+            "distance_z": 0.0,
+            "stability": 100.0,
+            "angle": 0.0,
+            "stats": {
+                "clicks": 0,
+                "right_clicks": 0,
+                "drags": 0,
+                "scroll_amount": 0,
+                "vol_steps": 0
+            }
+        }
+        self.frame_times = []
+        self._last_raw_x = None
+        self._last_raw_y = None
+
+    def _update_fps(self, now):
+        self.frame_times.append(now)
+        if len(self.frame_times) > 30:
+            self.frame_times.pop(0)
+        
+        if len(self.frame_times) > 1:
+            dt = self.frame_times[-1] - self.frame_times[0]
+            if dt > 0:
+                self.metrics["fps"] = (len(self.frame_times) - 1) / dt
+
     def can_start_gesture(self, gesture_type, now):
         if self.active_gesture is None:
             return True
@@ -166,33 +199,53 @@ class GestureProcessor:
         self.active_gesture = None
 
     def _move_cursor_stable(self, x, y, now):
-        x = self.fx(x, now)
-        y = self.fy(y, now)
+        raw_x, raw_y = x, y
+        
+        # Velocity calculation
+        if self._last_raw_x is not None and self.frame_times:
+            dt = max(1e-6, now - self.frame_times[-1]) if len(self.frame_times) > 1 else 0.033
+            dist = math.hypot(raw_x - self._last_raw_x, raw_y - self._last_raw_y)
+            self.metrics["velocity"] = dist / dt
+        
+        self._last_raw_x, self._last_raw_y = raw_x, raw_y
 
-        x = clamp(x, 0, SCREEN_W - 1)
-        y = clamp(y, 0, SCREEN_H - 1)
+        # Filtering
+        ux = self.fx(raw_x, now)
+        uy = self.fy(raw_y, now)
+
+        # Stability Metric: Comparison of raw movement vs filtered movement
+        # Small jitter in raw should be absorbed by filter.
+        raw_move = math.hypot(raw_x - (self.prev_mx or raw_x), raw_y - (self.prev_my or raw_y))
+        filt_move = math.hypot(ux - (self.prev_mx or ux), uy - (self.prev_my or uy))
+        if raw_move > 0.1:
+            # Stability is high if filt_move is smooth compared to raw_move
+            ratio = clamp(filt_move / raw_move, 0, 1)
+            self.metrics["stability"] = 100 * (1.0 - abs(raw_move - filt_move) / (raw_move + 1e-6))
+        
+        ux = clamp(ux, 0, SCREEN_W - 1)
+        uy = clamp(uy, 0, SCREEN_H - 1)
 
         if self.prev_mx is None:
-            self.prev_mx, self.prev_my = x, y
-            pyautogui.moveTo(x, y, duration=0)
+            self.prev_mx, self.prev_my = ux, uy
+            pyautogui.moveTo(ux, uy, duration=0)
             return
 
-        dx = x - self.prev_mx
-        dy = y - self.prev_my
+        dx = ux - self.prev_mx
+        dy = uy - self.prev_my
 
         if abs(dx) < CURSOR_DEADZONE_PX:
-            x = self.prev_mx
+            ux = self.prev_mx
         if abs(dy) < CURSOR_DEADZONE_PX:
-            y = self.prev_my
+            uy = self.prev_my
 
-        step = math.hypot(x - self.prev_mx, y - self.prev_my)
+        step = math.hypot(ux - self.prev_mx, uy - self.prev_my)
         if step > CURSOR_MAX_STEP_PX:
             r = CURSOR_MAX_STEP_PX / max(1e-6, step)
-            x = self.prev_mx + (x - self.prev_mx) * r
-            y = self.prev_my + (y - self.prev_my) * r
+            ux = self.prev_mx + (ux - self.prev_mx) * r
+            uy = self.prev_my + (uy - self.prev_my) * r
 
-        self.prev_mx, self.prev_my = x, y
-        pyautogui.moveTo(x, y, duration=0)
+        self.prev_mx, self.prev_my = ux, uy
+        pyautogui.moveTo(ux, uy, duration=0)
 
     def _reset_if_hand_lost(self):
         if self.dragging:
@@ -209,19 +262,31 @@ class GestureProcessor:
         self.prev_vol_ref_x = None
         self.clear_active_gesture()
         self.last_gesture_text = "Bekleniyor"
+        self.metrics["hand_visible"] = False
+        self.metrics["velocity"] = 0.0
+        self._last_raw_x = None
+        self._last_raw_y = None
 
     def process_frame(self, frame):
+        t_start = time.time()
         frame = cv2.flip(frame, 1)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         res = self.hands.process(rgb)
         now = time.time()
 
+        self._update_fps(now)
+
         status_text = "El Algılanamadı"
-        gesture_text = self.last_gesture_text  # default: en son ne ise onu göster
+        gesture_text = self.last_gesture_text
 
         if not res.multi_hand_landmarks:
             self._reset_if_hand_lost()
-            return frame, status_text, gesture_text
+            self.metrics["latency"] = (time.time() - t_start) * 1000
+            return frame, status_text, gesture_text, self.metrics
+
+        self.metrics["hand_visible"] = True
+        if res.multi_handedness:
+            self.metrics["detection_confidence"] = res.multi_handedness[0].classification[0].score * 100
 
         hand_landmarks = res.multi_hand_landmarks[0]
         pts = [(lm.x, lm.y, lm.z) for lm in hand_landmarks.landmark]
@@ -235,6 +300,15 @@ class GestureProcessor:
         middle_tip = (pts[12][0], pts[12][1])
         ring_tip = (pts[16][0], pts[16][1])
         pinky_tip = (pts[20][0], pts[20][1])
+
+        # Distance calculation (Z proxy)
+        dist_px = norm_dist(pts[0], pts[9]) # Wrist to Middle MCP distance in norm coords
+        self.metrics["distance_z"] = clamp(dist_px * 500, 0, 100) # Arbitrary scaling for 0-100 range
+
+        # Angle Calculation
+        dy_angle = pts[12][1] - pts[0][1]
+        dx_angle = pts[12][0] - pts[0][0]
+        self.metrics["angle"] = math.degrees(math.atan2(-dy_angle, dx_angle))
 
         if USE_BLEND_POINT:
             nx = 0.65 * thumb_tip[0] + 0.35 * index_mcp[0]
@@ -259,7 +333,7 @@ class GestureProcessor:
 
         status_text = "El Takip Ediliyor"
 
-        # 1) SES (başparmak + serçe)
+        # 1) SES
         if d_thumb_pinky < pinch_th and self.can_start_gesture("volume", now):
             if not self.volume_active:
                 self.volume_active = True
@@ -277,18 +351,20 @@ class GestureProcessor:
                 dx = index_tip[0] - self.prev_vol_ref_x
                 if dx > VOLUME_STEP_DX:
                     volume_system_control("increase")
+                    self.metrics["stats"]["vol_steps"] += 1
                     self.prev_vol_ref_x = index_tip[0]
                     self.last_vol_time = now
                     status_text = "SES: ARTTIRILIYOR"
                     gesture_text = "Ses Arttır"
                 elif dx < -VOLUME_STEP_DX:
                     volume_system_control("decrease")
+                    self.metrics["stats"]["vol_steps"] += 1
                     self.prev_vol_ref_x = index_tip[0]
                     self.last_vol_time = now
                     status_text = "SES: AZALTILIYOR"
                     gesture_text = "Ses Azalt"
 
-        # 2) SCROLL (başparmak + yüzük)
+        # 2) SCROLL
         elif d_thumb_ring < pinch_th and self.can_start_gesture("scroll", now):
             if not self.scroll_pinch_active:
                 self.scroll_pinch_active = True
@@ -307,11 +383,12 @@ class GestureProcessor:
                 scroll_amount = int(-dy * SCROLL_SENSITIVITY)
                 if abs(scroll_amount) > 5:
                     pyautogui.scroll(scroll_amount)
+                    self.metrics["stats"]["scroll_amount"] += abs(scroll_amount)
                     self.prev_scroll_ref_y = index_tip[1]
                     self.last_scroll_time = now
                     gesture_text = "Scroll"
 
-        # 3) SAĞ TIK (başparmak + orta)
+        # 3) SAĞ TIK
         elif d_thumb_middle < pinch_th and self.can_start_gesture("right", now):
             if not self.right_pinch_active:
                 self.right_pinch_active = True
@@ -320,12 +397,13 @@ class GestureProcessor:
             self.right_pinch_active = False
             if (now - self.right_pinch_last_click) > 0.30:
                 pyautogui.click(button="right")
+                self.metrics["stats"]["right_clicks"] += 1
                 self.right_pinch_last_click = now
                 status_text = "ISLEM: SAG TIK"
                 gesture_text = "Sağ Tıklandı"
             self.clear_active_gesture()
 
-        # 4) SOL TIK / SÜRÜKLE (başparmak + işaret)
+        # 4) SOL TIK / SÜRÜKLE
         elif d_thumb_index < pinch_th and self.can_start_gesture("left", now):
             if not self.left_pinch_active:
                 self.left_pinch_active = True
@@ -336,11 +414,13 @@ class GestureProcessor:
             if self.dragging:
                 pyautogui.mouseUp()
                 self.dragging = False
+                self.metrics["stats"]["drags"] += 1
                 status_text = "ISLEM: SURUKLEME BITTI"
                 gesture_text = "Sürükleme Bitti"
             else:
                 if (now - self.left_pinch_start_time) < DRAG_HOLD_DELAY:
                     pyautogui.click()
+                    self.metrics["stats"]["clicks"] += 1
                     status_text = "ISLEM: SOL TIK"
                     gesture_text = "Sol Tıklandı"
             self.clear_active_gesture()
@@ -360,18 +440,14 @@ class GestureProcessor:
             lm = hand_landmarks.landmark[idx]
             cx, cy = int(lm.x * w), int(lm.y * h)
             color = (0, 255, 0)
-            if idx == 20 and self.volume_active:
-                color = (255, 0, 0)
-            if idx == 16 and self.scroll_pinch_active:
-                color = (255, 255, 0)
-            if idx == 4:
-                color = (0, 255, 255)
+            if idx == 20 and self.volume_active: color = (255, 0, 0)
+            if idx == 16 and self.scroll_pinch_active: color = (255, 255, 0)
+            if idx == 4: color = (0, 255, 255)
             cv2.circle(frame, (cx, cy), 5, color, -1)
 
-        cv2.putText(frame, f"pinch_th={pinch_th:.3f}", (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+        self.metrics["latency"] = (time.time() - t_start) * 1000
+        return frame, status_text, gesture_text, self.metrics
 
-        return frame, status_text, gesture_text
 
 
 def main():
